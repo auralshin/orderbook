@@ -1,6 +1,7 @@
 use crate::order::{BidOrAsk, MatchedOrder, Order, OrderType, Price};
 use serde::Deserialize;
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -190,6 +191,7 @@ impl OrderBook {
         while remaining_amount > 0.0 {
             if let Some((price, orders)) = book_iter.next() {
                 while let Some(mut order) = orders.pop_front() {
+                    let id = order.id;
                     let filled_amount = if order.amount <= remaining_amount {
                         remaining_amount -= order.amount;
                         order.amount
@@ -203,7 +205,7 @@ impl OrderBook {
 
                     matched_orders.push(MatchedOrder {
                         id: market_order.id,
-                        matched_with_id: order_id,
+                        matched_with_id: id,
                         order_type: market_order.order_type.clone(),
                         price: price.clone(),
                         amount: filled_amount,
@@ -262,6 +264,7 @@ impl OrderBook {
                 }
 
                 while let Some(mut order) = orders.pop_front() {
+                    let id = order.id;
                     let filled_amount = if order.amount <= remaining_amount {
                         remaining_amount -= order.amount;
                         order.amount
@@ -275,7 +278,7 @@ impl OrderBook {
 
                     matched_orders.push(MatchedOrder {
                         id: limit_order.id,
-                        matched_with_id: order_id,
+                        matched_with_id: id,
                         order_type: limit_order.order_type.clone(),
                         price: price.clone(),
                         amount: filled_amount,
@@ -320,7 +323,6 @@ impl OrderBook {
     }
 }
 
-use std::cmp::Ordering;
 impl Ord for Price {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.integral().cmp(&other.integral()) {
