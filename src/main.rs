@@ -1,11 +1,8 @@
-mod api;
-mod order;
-mod order_book;
-mod websocket;
 use actix_cors::Cors;
-use actix_web::{http, App, HttpServer};
-use order::MatchedOrder;
+use actix_web::{http, web, App, HttpServer};
+use models::MatchedOrder;
 use order_book::OrderBook;
+use orderbook::{api, models, order_book};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +23,7 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .wrap(cors)
-            .data(order_book) // Share the OrderBook state with the app
+            .app_data(web::Data::new(order_book)) // Share the OrderBook state with the app
             .configure(|cfg| api::config(cfg, rx_clone)) // Configure your API routes
     })
     .bind("127.0.0.1:8080")?

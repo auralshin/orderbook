@@ -1,10 +1,9 @@
-use crate::order::{BidOrAsk, MatchedOrder, Order, OrderType, Price};
+use crate::models::{BidOrAsk, MatchedOrder, Order, OrderType, Price};
 use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::Sender;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OrderBook {
@@ -167,7 +166,7 @@ impl OrderBook {
         let mut matched_orders = Vec::new();
         let mut removal_candidates = Vec::new();
         let mut remaining_amount = market_order.amount;
-        let order_id = market_order.id;
+        let _order_id = market_order.id;
 
         let book = match market_order.bid_or_ask {
             BidOrAsk::Bid => &mut self.asks,
@@ -345,3 +344,110 @@ impl PartialEq for Price {
 }
 
 impl Eq for Price {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{BidOrAsk, Order, OrderType, Price};
+
+    fn test_order(
+        id: u64,
+        order_type: OrderType,
+        bid_or_ask: BidOrAsk,
+        amount: f64,
+        price: f64,
+    ) -> Order {
+        Order {
+            id,
+            order_type,
+            trading_pair: "BTC-USD".to_string(),
+            amount,
+            price: Some(Price::new(price)),
+            timestamp: 0,
+            bid_or_ask,
+        }
+    }
+
+    #[test]
+    fn test_add_limit_bid_order() {
+        let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
+        let mut book = OrderBook::new(dummy_tx);
+
+        let order = test_order(1, OrderType::Limit, BidOrAsk::Bid, 1.0, 10000.0);
+        book.add_order(order, 0);
+
+        let bids = book.get_all_bids();
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].amount, 1.0);
+    }
+
+    #[test]
+    fn test_add_limit_ask_order() {
+        let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
+        let mut book = OrderBook::new(dummy_tx);
+
+        let order = test_order(2, OrderType::Limit, BidOrAsk::Ask, 2.0, 10500.0);
+        book.add_order(order, 0);
+
+        let asks = book.get_all_asks();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].amount, 2.0);
+    }
+
+    #[test]
+    fn test_match_limit_order_bid_hits_ask() {
+        let (tx, _rx) = std::sync::mpsc::channel::<MatchedOrder>();
+        let mut book = OrderBook::new(tx);
+
+        let ask = test_order(10, OrderType::Limit, BidOrAsk::Ask, 1.0, 9500.0);
+        book.add_order(ask, 0);
+
+        let bid = test_order(11, OrderType::Limit, BidOrAsk::Bid, 1.0, 9600.0);
+        let matches = book.match_limit_order(bid);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched_with_id, 10);
+    }
+
+    #[test]
+    fn test_partial_fill() {
+        let (tx, _rx) = std::sync::mpsc::channel::<MatchedOrder>();
+        let mut book = OrderBook::new(tx);
+
+        let ask = test_order(1, OrderType::Limit, BidOrAsk::Ask, 2.0, 9500.0);
+        book.add_order(ask, 0);
+
+        let bid = test_order(2, OrderType::Limit, BidOrAsk::Bid, 1.0, 9600.0);
+        let matched = book.match_limit_order(bid);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].amount, 1.0);
+
+        // Check remaining ask
+        let remaining = book.get_all_asks();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].amount, 1.0);
+    }
+
+    #[test]
+    fn test_best_bid_and_ask() {
+        let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
+        let mut book = OrderBook::new(dummy_tx);
+
+        let ask1 = test_order(1, OrderType::Limit, BidOrAsk::Ask, 1.0, 9800.0);
+        let ask2 = test_order(2, OrderType::Limit, BidOrAsk::Ask, 1.0, 9700.0);
+        book.add_order(ask1, 0);
+        book.add_order(ask2, 0);
+
+        let bid1 = test_order(3, OrderType::Limit, BidOrAsk::Bid, 1.0, 9400.0);
+        let bid2 = test_order(4, OrderType::Limit, BidOrAsk::Bid, 1.0, 9600.0);
+        book.add_order(bid1, 0);
+        book.add_order(bid2, 0);
+
+        let best_ask = book.get_best_ask().unwrap();
+        let best_bid = book.get_best_bid().unwrap();
+
+        assert_eq!(best_ask.integral(), 9700);
+        assert_eq!(best_bid.integral(), 9600);
+    }
+}

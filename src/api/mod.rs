@@ -1,9 +1,9 @@
-use crate::order::{self, MatchedOrder, Order};
+use crate::models::{MatchedOrder, Order};
 use crate::order_book::OrderBook;
 use crate::websocket::MyWebSocket;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_web_actors::ws;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 

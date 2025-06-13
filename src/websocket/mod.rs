@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Receiver};
 use actix::{Actor, StreamHandler};
 use actix_web_actors::ws;
 
-use crate::order::MatchedOrder;
+use crate::models::MatchedOrder;
 use actix::AsyncContext;
 use std::sync::{Arc, Mutex};
 pub struct MyWebSocket {

@@ -11,7 +11,7 @@ actix-web = "4.4.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio-postgres = "0.7"
-tokio = "1"
+tokio = { version = "1", features = ["sync"] }
 futures-util = "0.3"
 # Used for atomic operations in utilities
 atomic = "0.6.0"
