@@ -63,6 +63,44 @@ impl OrderBook {
         self
     }
 
+    pub fn cancel_order(&mut self, order_id: &str) -> Option<Order> {
+        let mut removed_price = None;
+        let mut removed_order = None;
+
+        for (price, orders) in self.bids.iter_mut() {
+            if let Some(pos) = orders.iter().position(|o| o.id.to_string() == order_id) {
+                removed_order = orders.remove(pos);
+                if orders.is_empty() {
+                    removed_price = Some(*price);
+                }
+                break;
+            }
+        }
+        if let Some(price) = removed_price {
+            self.bids.remove(&price);
+            return removed_order;
+        }
+        if removed_order.is_some() {
+            return removed_order;
+        }
+
+        removed_price = None;
+
+        for (price, orders) in self.asks.iter_mut() {
+            if let Some(pos) = orders.iter().position(|o| o.id.to_string() == order_id) {
+                removed_order = orders.remove(pos);
+                if orders.is_empty() {
+                    removed_price = Some(*price);
+                }
+                break;
+            }
+        }
+        if let Some(price) = removed_price {
+            self.asks.remove(&price);
+        }
+        removed_order
+    }
+
     pub fn get_all_bids(&self) -> Vec<Order> {
         let mut orders = Vec::new();
         for (_, order) in self.bids.iter() {
@@ -449,5 +487,30 @@ mod tests {
 
         assert_eq!(best_ask.integral(), 9700);
         assert_eq!(best_bid.integral(), 9600);
+    }
+
+    #[test]
+    fn cancel_existing_order() {
+        let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
+        let mut book = OrderBook::new(dummy_tx);
+
+        let ask1 = test_order(1, OrderType::Limit, BidOrAsk::Ask, 1.0, 9800.0);
+        book.add_order(ask1, 0);
+
+        let canceled_order = book.cancel_order("1");
+        assert!(canceled_order.is_some());
+        assert!(book.get_all_bids().is_empty());
+    }
+
+    #[test]
+    fn test_cancel_nonexistent_order() {
+        let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
+        let mut book = OrderBook::new(dummy_tx);
+
+        let order = test_order(1, OrderType::Limit, BidOrAsk::Bid, 1.0, 10000.0);
+        book.add_order(order, 0);
+
+        let removed = book.cancel_order("999");
+        assert!(removed.is_none());
     }
 }

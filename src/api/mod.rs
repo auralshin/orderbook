@@ -20,8 +20,11 @@ pub fn config(cfg: &mut web::ServiceConfig, rx: Arc<Mutex<Receiver<MatchedOrder>
             .route(web::post().to(create_order))
             .route(web::get().to(get_orders)),
     );
+    cfg.service(web::resource("/orders/{order_id}").route(web::delete().to(cancel_order)));
     cfg.service(web::resource("/asks").route(web::get().to(get_all_asks)));
     cfg.service(web::resource("/bids").route(web::get().to(get_all_bids)));
+    cfg.service(web::resource("/best_bid").route(web::get().to(best_bid)));
+    cfg.service(web::resource("/best_ask").route(web::get().to(best_ask)));
 }
 
 async fn health_check() -> HttpResponse {
@@ -61,4 +64,28 @@ async fn get_orders(order_book: web::Data<Arc<Mutex<OrderBook>>>) -> HttpRespons
     let order_book = order_book.lock().unwrap();
     let order_book = order_book.get_orders();
     HttpResponse::Ok().json(order_book)
+}
+
+async fn cancel_order(
+    order_id: web::Path<String>,
+    order_book: web::Data<Arc<Mutex<OrderBook>>>,
+) -> HttpResponse {
+    let order_id = order_id.into_inner();
+    let mut order_book = order_book.lock().unwrap();
+    match order_book.cancel_order(&order_id) {
+        Some(order) => HttpResponse::Ok().json(order),
+        None => HttpResponse::NotFound().body(format!("Order with ID {} not found", order_id)),
+    }
+}
+
+async fn best_bid(order_book: web::Data<Arc<Mutex<OrderBook>>>) -> HttpResponse {
+    let order_book = order_book.lock().unwrap();
+    let best_bid = order_book.get_best_bid().copied();
+    HttpResponse::Ok().json(best_bid)
+}
+
+async fn best_ask(order_book: web::Data<Arc<Mutex<OrderBook>>>) -> HttpResponse {
+    let order_book = order_book.lock().unwrap();
+    let best_ask = order_book.get_best_ask().copied();
+    HttpResponse::Ok().json(best_ask)
 }
