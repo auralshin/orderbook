@@ -7,6 +7,19 @@ use tokio::sync::broadcast::Sender;
 
 mod price;
 
+fn can_trade_with(a: &Order, b: &Order) -> bool {
+    if let (Some(ida), Some(idb)) = (a.owner_id.as_ref(), b.owner_id.as_ref()) {
+        ida != idb
+    } else {
+        true
+    }
+}
+
+// Self-Trade Prevention (STP): when both orders have an `owner_id` set and
+// they are equal, taker orders must not match against resting orders with the
+// same owner. This helper centralizes that logic so behavior is consistent
+// across market and limit matching and easier to adjust in the future.
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SideBook {
     pub bids: BTreeMap<Price, VecDeque<Order>>,
@@ -30,6 +43,8 @@ impl Default for OrderBook {
 }
 
 impl OrderBook {
+    // ...existing code...
+
     fn ensure_book(&mut self, trading_pair: &str) -> &mut SideBook {
         self.books
             .entry(trading_pair.to_string())
@@ -54,13 +69,18 @@ impl OrderBook {
         let is_market_order = order.order_type == OrderType::Market;
         let bid_or_ask = order.bid_or_ask.clone();
 
-        self.ensure_book(trading_pair);
-
+        // For FOK orders we should only attempt the dry-run if the book exists.
+        // Avoid creating an empty book just to run the check.
         if !is_market_order && order.tif == Some(Tif::Fok) {
+            if self.get_book(trading_pair).is_none() {
+                return self;
+            }
             if !self.can_fully_fill_limit(trading_pair, &order) {
                 return self;
             }
         }
+
+        self.ensure_book(trading_pair);
 
         let matched_orders = if is_market_order {
             self.match_market_order(trading_pair, order.clone())
@@ -271,12 +291,8 @@ impl OrderBook {
                         break;
                     }
                     for o in orders.iter() {
-                        if let (Some(a), Some(b)) =
-                            (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
-                        {
-                            if a == b {
-                                continue;
-                            }
+                        if !can_trade_with(limit_order, o) {
+                            continue;
                         }
                         if o.amount >= remaining {
                             return true;
@@ -291,12 +307,8 @@ impl OrderBook {
                         break;
                     }
                     for o in orders.iter() {
-                        if let (Some(a), Some(b)) =
-                            (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
-                        {
-                            if a == b {
-                                continue;
-                            }
+                        if !can_trade_with(limit_order, o) {
+                            continue;
                         }
                         if o.amount >= remaining {
                             return true;
@@ -341,15 +353,9 @@ impl OrderBook {
 
             if let Some(orders) = book_side.get_mut(price) {
                 loop {
-                    let pos = orders.iter().position(|ord| {
-                        if let (Some(a), Some(b)) =
-                            (market_order.owner_id.as_ref(), ord.owner_id.as_ref())
-                        {
-                            a != b
-                        } else {
-                            true
-                        }
-                    });
+                    let pos = orders
+                        .iter()
+                        .position(|ord| can_trade_with(&market_order, ord));
 
                     if let Some(p) = pos {
                         let mut order = orders.remove(p).expect("valid index");
@@ -437,20 +443,17 @@ impl OrderBook {
                     let eligible_here = *price <= order_price;
                     if eligible_here {
                         encountered_eligible = true;
-                    } else if !(encountered_eligible && !matched_in_eligible) {
-                        break;
+                    } else {
+                        // If we hit a non-eligible price and either we haven't seen any eligible
+                        // prices yet, or we've matched at an eligible price already, then stop.
+                        if !encountered_eligible || matched_in_eligible {
+                            break;
+                        }
+                        // Otherwise, we encountered eligible prices but didn't match (STP); continue scanning.
                     }
 
                     loop {
-                        let pos = orders.iter().position(|o| {
-                            if let (Some(a), Some(b)) =
-                                (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
-                            {
-                                a != b
-                            } else {
-                                true
-                            }
-                        });
+                        let pos = orders.iter().position(|o| can_trade_with(&limit_order, o));
                         if let Some(p) = pos {
                             let mut order = orders.remove(p).expect("valid index");
                             let id = order.id;
@@ -511,20 +514,14 @@ impl OrderBook {
                     let eligible_here = *price >= order_price;
                     if eligible_here {
                         encountered_eligible = true;
-                    } else if !(encountered_eligible && !matched_in_eligible) {
-                        break;
+                    } else {
+                        if !encountered_eligible || matched_in_eligible {
+                            break;
+                        }
                     }
 
                     loop {
-                        let pos = orders.iter().position(|o| {
-                            if let (Some(a), Some(b)) =
-                                (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
-                            {
-                                a != b
-                            } else {
-                                true
-                            }
-                        });
+                        let pos = orders.iter().position(|o| can_trade_with(&limit_order, o));
                         if let Some(p) = pos {
                             let mut order = orders.remove(p).expect("valid index");
                             let id = order.id;
