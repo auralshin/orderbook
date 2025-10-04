@@ -1,4 +1,4 @@
-use crate::models::{BidOrAsk, MatchedOrder, Order, OrderType, Price};
+use crate::models::{BidOrAsk, MatchedOrder, Order, OrderType, Price, Tif};
 use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -54,6 +54,12 @@ impl OrderBook {
 
         self.ensure_book(trading_pair);
 
+        if !is_market_order && order.tif == Some(Tif::Fok) {
+            if !self.can_fully_fill_limit(trading_pair, &order) {
+                return self;
+            }
+        }
+
         let matched_orders = if is_market_order {
             self.match_market_order(trading_pair, order.clone())
         } else {
@@ -65,8 +71,7 @@ impl OrderBook {
             order.amount -= total_matched;
         }
 
-        // Rest only if there's remaining quantity AND a price (i.e., limit order)
-        if order.amount > 0.0 {
+        if order.amount > 0.0 && order.tif != Some(Tif::Ioc) {
             if let Some(price) = order.price.clone() {
                 let side_book = self.ensure_book(trading_pair);
                 let book = match bid_or_ask {
@@ -116,7 +121,6 @@ impl OrderBook {
             }
         }
 
-        // If the pair is empty, drop the book
         if self
             .books
             .get(trading_pair)
@@ -242,6 +246,68 @@ impl OrderBook {
             .and_then(|book| book.asks.keys().next())
     }
 
+    fn can_fully_fill_limit(&self, trading_pair: &str, limit_order: &Order) -> bool {
+        let mut remaining = limit_order.amount;
+        let order_price = match limit_order.price {
+            Some(ref p) => p.clone(),
+            None => return false,
+        };
+
+        let Some(book) = self.books.get(trading_pair) else {
+            return false;
+        };
+
+        let book_side = match limit_order.bid_or_ask {
+            BidOrAsk::Bid => &book.asks,
+            BidOrAsk::Ask => &book.bids,
+        };
+
+        match limit_order.bid_or_ask {
+            BidOrAsk::Bid => {
+                for (price, orders) in book_side.iter() {
+                    if *price > order_price {
+                        break;
+                    }
+                    for o in orders.iter() {
+                        if let (Some(a), Some(b)) =
+                            (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
+                        {
+                            if a == b {
+                                continue;
+                            }
+                        }
+                        if o.amount >= remaining {
+                            return true;
+                        }
+                        remaining -= o.amount;
+                    }
+                }
+            }
+            BidOrAsk::Ask => {
+                for (price, orders) in book_side.iter().rev() {
+                    if *price < order_price {
+                        break;
+                    }
+                    for o in orders.iter() {
+                        if let (Some(a), Some(b)) =
+                            (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
+                        {
+                            if a == b {
+                                continue;
+                            }
+                        }
+                        if o.amount >= remaining {
+                            return true;
+                        }
+                        remaining -= o.amount;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     pub fn match_market_order(
         &mut self,
         trading_pair: &str,
@@ -250,117 +316,87 @@ impl OrderBook {
         let mut matched_orders = Vec::new();
         let mut remaining_amount = market_order.amount;
 
-        let maybe_book = self.books.get_mut(trading_pair);
-        if maybe_book.is_none() {
+        let Some(book) = self.books.get_mut(trading_pair) else {
             return matched_orders;
-        }
-        let book = maybe_book.unwrap();
-
-        // Select opposite side to take liquidity from
-        let book_side = match market_order.bid_or_ask {
-            BidOrAsk::Bid => &mut book.asks, // buy market -> hit asks (ascending)
-            BidOrAsk::Ask => &mut book.bids, // sell market -> hit bids (descending)
         };
 
-        while remaining_amount > 0.0 {
-            let mut to_remove = Vec::new();
-            let mut matched_level = false;
+        let book_side = match market_order.bid_or_ask {
+            BidOrAsk::Bid => &mut book.asks,
+            BidOrAsk::Ask => &mut book.bids,
+        };
 
-            match market_order.bid_or_ask {
-                BidOrAsk::Bid => {
-                    // Lowest ask first
-                    let mut it = book_side.iter_mut();
-                    if let Some((price, orders)) = it.next() {
-                        while let Some(mut order) = orders.pop_front() {
-                            let id = order.id;
-                            let filled_amount = if order.amount <= remaining_amount {
-                                remaining_amount -= order.amount;
-                                order.amount
-                            } else {
-                                let filled = remaining_amount;
-                                remaining_amount = 0.0;
-                                order.amount -= filled;
-                                orders.push_front(order);
-                                filled
-                            };
+        let mut prices: Vec<Price> = book_side.keys().cloned().collect();
+        if matches!(market_order.bid_or_ask, BidOrAsk::Ask) {
+            prices.reverse();
+        }
 
-                            matched_orders.push(MatchedOrder {
-                                id: market_order.id,
-                                matched_with_id: id,
-                                order_type: market_order.order_type.clone(),
-                                price: price.clone(),
-                                amount: filled_amount,
-                                bid_or_ask: market_order.bid_or_ask.clone(),
-                                trading_pair: trading_pair.to_string(),
-                            });
+        let mut to_remove = Vec::new();
 
-                            if remaining_amount <= 0.0 {
-                                break;
-                            }
-                        }
-
-                        if orders.is_empty() {
-                            to_remove.push(*price);
-                        }
-
-                        // We had at least one level to process
-                        matched_level = true;
-                    }
-                }
-                BidOrAsk::Ask => {
-                    // Highest bid first
-                    let mut it = book_side.iter_mut();
-                    if let Some((price, orders)) = it.next_back() {
-                        while let Some(mut order) = orders.pop_front() {
-                            let id = order.id;
-                            let filled_amount = if order.amount <= remaining_amount {
-                                remaining_amount -= order.amount;
-                                order.amount
-                            } else {
-                                let filled = remaining_amount;
-                                remaining_amount = 0.0;
-                                order.amount -= filled;
-                                orders.push_front(order);
-                                filled
-                            };
-
-                            matched_orders.push(MatchedOrder {
-                                id: market_order.id,
-                                matched_with_id: id,
-                                order_type: market_order.order_type.clone(),
-                                price: price.clone(),
-                                amount: filled_amount,
-                                bid_or_ask: market_order.bid_or_ask.clone(),
-                                trading_pair: trading_pair.to_string(),
-                            });
-
-                            if remaining_amount <= 0.0 {
-                                break;
-                            }
-                        }
-
-                        if orders.is_empty() {
-                            to_remove.push(*price);
-                        }
-
-                        matched_level = true;
-                    }
-                }
-            }
-
-            for price in to_remove {
-                book_side.remove(&price);
-            }
-
-            // Nothing to match (book empty)
-            if !matched_level {
+        'levels: for price in prices.iter() {
+            if remaining_amount <= 0.0 {
                 break;
+            }
+
+            if let Some(orders) = book_side.get_mut(price) {
+                loop {
+                    let pos = orders.iter().position(|ord| {
+                        if let (Some(a), Some(b)) =
+                            (market_order.owner_id.as_ref(), ord.owner_id.as_ref())
+                        {
+                            a != b
+                        } else {
+                            true
+                        }
+                    });
+
+                    if let Some(p) = pos {
+                        let mut order = orders.remove(p).expect("valid index");
+                        let id = order.id;
+
+                        let filled_amount = if order.amount <= remaining_amount {
+                            remaining_amount -= order.amount;
+                            order.amount
+                        } else {
+                            let filled = remaining_amount;
+                            remaining_amount = 0.0;
+                            order.amount -= filled;
+                            orders.insert(p, order);
+                            filled
+                        };
+
+                        matched_orders.push(MatchedOrder {
+                            id: market_order.id,
+                            matched_with_id: id,
+                            order_type: market_order.order_type.clone(),
+                            price: *price,
+                            amount: filled_amount,
+                            bid_or_ask: market_order.bid_or_ask.clone(),
+                            trading_pair: trading_pair.to_string(),
+                        });
+
+                        if remaining_amount <= 0.0 {
+                            break 'levels;
+                        }
+
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+
+                if orders.is_empty() {
+                    to_remove.push(*price);
+                }
             }
         }
 
-        for matched_order in &matched_orders {
-            if let Some(sender) = self.notifier.as_ref() {
-                let _ = sender.send(matched_order.clone());
+        for p in to_remove {
+            book_side.remove(&p);
+        }
+
+        if let Some(tx) = self.notifier.as_ref() {
+            for m in &matched_orders {
+                let _ = tx.send(m.clone());
             }
         }
 
@@ -373,63 +409,80 @@ impl OrderBook {
         limit_order: Order,
     ) -> Vec<MatchedOrder> {
         let mut matched_orders = Vec::new();
-        let bid_or_ask = limit_order.bid_or_ask;
 
         let order_price = limit_order
             .price
             .expect("Limit orders must specify a price");
 
-        let maybe_book = self.books.get_mut(trading_pair);
-        if maybe_book.is_none() {
+        let Some(book) = self.books.get_mut(trading_pair) else {
             return matched_orders;
-        }
-        let book = maybe_book.unwrap();
+        };
 
-        // Select opposite side to take liquidity from
-        let book_side = match bid_or_ask {
-            BidOrAsk::Bid => &mut book.asks, // buy limit -> hit asks (ascending) up to order_price
-            BidOrAsk::Ask => &mut book.bids, // sell limit -> hit bids (descending) down to order_price
+        let book_side = match limit_order.bid_or_ask {
+            BidOrAsk::Bid => &mut book.asks,
+            BidOrAsk::Ask => &mut book.bids,
         };
 
         let mut remaining_amount = limit_order.amount;
 
-        while remaining_amount > 0.0 {
-            let mut to_remove = Vec::new();
-            let mut matched = false;
+        match limit_order.bid_or_ask {
+            BidOrAsk::Bid => {
+                let mut to_remove = Vec::new();
+                let mut encountered_eligible = false;
+                let mut matched_in_eligible = false;
 
-            if limit_order.bid_or_ask == BidOrAsk::Bid {
-                // Ascending asks up to <= order_price
                 for (price, orders) in book_side.iter_mut() {
-                    if *price > order_price {
+                    let eligible_here = *price <= order_price;
+                    if eligible_here {
+                        encountered_eligible = true;
+                    } else if !(encountered_eligible && !matched_in_eligible) {
                         break;
                     }
 
-                    while let Some(mut order) = orders.pop_front() {
-                        let id = order.id;
-                        let filled_amount = if order.amount <= remaining_amount {
-                            remaining_amount -= order.amount;
-                            order.amount
-                        } else {
-                            let filled = remaining_amount;
-                            remaining_amount = 0.0;
-                            order.amount -= filled;
-                            orders.push_front(order);
-                            filled
-                        };
-
-                        matched_orders.push(MatchedOrder {
-                            id: limit_order.id,
-                            matched_with_id: id,
-                            order_type: limit_order.order_type.clone(),
-                            price: price.clone(),
-                            amount: filled_amount,
-                            bid_or_ask: limit_order.bid_or_ask.clone(),
-                            trading_pair: trading_pair.to_string(),
+                    loop {
+                        let pos = orders.iter().position(|o| {
+                            if let (Some(a), Some(b)) =
+                                (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
+                            {
+                                a != b
+                            } else {
+                                true
+                            }
                         });
+                        if let Some(p) = pos {
+                            let mut order = orders.remove(p).expect("valid index");
+                            let id = order.id;
+                            let filled_amount = if order.amount <= remaining_amount {
+                                remaining_amount -= order.amount;
+                                order.amount
+                            } else {
+                                let filled = remaining_amount;
+                                remaining_amount = 0.0;
+                                order.amount -= filled;
+                                orders.insert(p, order);
+                                filled
+                            };
 
-                        matched = true;
+                            matched_orders.push(MatchedOrder {
+                                id: limit_order.id,
+                                matched_with_id: id,
+                                order_type: limit_order.order_type.clone(),
+                                price: *price,
+                                amount: filled_amount,
+                                bid_or_ask: limit_order.bid_or_ask.clone(),
+                                trading_pair: trading_pair.to_string(),
+                            });
 
-                        if remaining_amount <= 0.0 {
+                            if eligible_here {
+                                matched_in_eligible = true;
+                            }
+
+                            if remaining_amount <= 0.0 {
+                                break;
+                            }
+
+                            continue;
+                        } else {
                             break;
                         }
                     }
@@ -438,43 +491,72 @@ impl OrderBook {
                         to_remove.push(*price);
                     }
 
-                    if matched {
+                    if remaining_amount <= 0.0 {
                         break;
                     }
                 }
-            } else {
-                // Descending bids down to >= order_price
+
+                for p in to_remove {
+                    book_side.remove(&p);
+                }
+            }
+            BidOrAsk::Ask => {
+                let mut to_remove = Vec::new();
+                let mut encountered_eligible = false;
+                let mut matched_in_eligible = false;
+
                 for (price, orders) in book_side.iter_mut().rev() {
-                    if *price < order_price {
+                    let eligible_here = *price >= order_price;
+                    if eligible_here {
+                        encountered_eligible = true;
+                    } else if !(encountered_eligible && !matched_in_eligible) {
                         break;
                     }
 
-                    while let Some(mut order) = orders.pop_front() {
-                        let id = order.id;
-                        let filled_amount = if order.amount <= remaining_amount {
-                            remaining_amount -= order.amount;
-                            order.amount
-                        } else {
-                            let filled = remaining_amount;
-                            remaining_amount = 0.0;
-                            order.amount -= filled;
-                            orders.push_front(order);
-                            filled
-                        };
-
-                        matched_orders.push(MatchedOrder {
-                            id: limit_order.id,
-                            matched_with_id: id,
-                            order_type: limit_order.order_type.clone(),
-                            price: price.clone(),
-                            amount: filled_amount,
-                            bid_or_ask: limit_order.bid_or_ask.clone(),
-                            trading_pair: trading_pair.to_string(),
+                    loop {
+                        let pos = orders.iter().position(|o| {
+                            if let (Some(a), Some(b)) =
+                                (limit_order.owner_id.as_ref(), o.owner_id.as_ref())
+                            {
+                                a != b
+                            } else {
+                                true
+                            }
                         });
+                        if let Some(p) = pos {
+                            let mut order = orders.remove(p).expect("valid index");
+                            let id = order.id;
+                            let filled_amount = if order.amount <= remaining_amount {
+                                remaining_amount -= order.amount;
+                                order.amount
+                            } else {
+                                let filled = remaining_amount;
+                                remaining_amount = 0.0;
+                                order.amount -= filled;
+                                orders.insert(p, order);
+                                filled
+                            };
 
-                        matched = true;
+                            matched_orders.push(MatchedOrder {
+                                id: limit_order.id,
+                                matched_with_id: id,
+                                order_type: limit_order.order_type.clone(),
+                                price: *price,
+                                amount: filled_amount,
+                                bid_or_ask: limit_order.bid_or_ask.clone(),
+                                trading_pair: trading_pair.to_string(),
+                            });
 
-                        if remaining_amount <= 0.0 {
+                            if eligible_here {
+                                matched_in_eligible = true;
+                            }
+
+                            if remaining_amount <= 0.0 {
+                                break;
+                            }
+
+                            continue;
+                        } else {
                             break;
                         }
                     }
@@ -483,24 +565,20 @@ impl OrderBook {
                         to_remove.push(*price);
                     }
 
-                    if matched {
+                    if remaining_amount <= 0.0 {
                         break;
                     }
                 }
-            }
 
-            for price in to_remove {
-                book_side.remove(&price);
-            }
-
-            if !matched {
-                break;
+                for p in to_remove {
+                    book_side.remove(&p);
+                }
             }
         }
 
-        for matched_order in &matched_orders {
-            if let Some(sender) = self.notifier.as_ref() {
-                let _ = sender.send(matched_order.clone());
+        if let Some(sender) = self.notifier.as_ref() {
+            for m in &matched_orders {
+                let _ = sender.send(m.clone());
             }
         }
 
@@ -551,6 +629,10 @@ mod tests {
             price: price.map(Price::new),
             timestamp: 0,
             bid_or_ask,
+            owner_id: None,
+            tif: None,
+            post_only: false,
+            max_slippage_bps: None,
         }
     }
 
@@ -609,7 +691,6 @@ mod tests {
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].amount, 1.0);
 
-        // Check remaining ask
         let remaining = book.get_all_asks("BTC-USD");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].amount, 1.0);
@@ -770,7 +851,7 @@ mod tests {
         assert_eq!(matched[0].price.integral(), 9600);
         assert!((matched[0].amount - 0.8).abs() < 1e-9);
 
-        // Remaining on the 9600 bid should be ~0.2 (allowing for fp rounding)
+        // Remaining on the 9600 bid should be ~0.2
         let remaining_bids = book.get_all_bids("BTC-USD");
         let high = remaining_bids.into_iter().find(|o| o.id == 301).unwrap();
         assert!(
@@ -974,5 +1055,160 @@ mod tests {
         // Market orders should never rest in the book
         let markets = book.get_market_orders_to_match("BTC-USD");
         assert!(markets.is_empty());
+    }
+
+    #[test]
+    fn test_market_bid_skips_stp_blocked_best_ask_and_fills_next() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<MatchedOrder>(64);
+        let mut book = OrderBook::new(tx);
+
+        // Best ask (10000) owned by alice -> STP should block incoming alice taker
+        let mut ask_best = test_order(7100, OrderType::Limit, BidOrAsk::Ask, 0.7, Some(10000.0));
+        ask_best.owner_id = Some("alice".into());
+        book.add_order("BTC-USD", ask_best, 0);
+
+        // Next ask (10100) owned by bob -> should be matched
+        let mut ask_next = test_order(7101, OrderType::Limit, BidOrAsk::Ask, 0.5, Some(10100.0));
+        ask_next.owner_id = Some("bob".into());
+        book.add_order("BTC-USD", ask_next, 0);
+
+        // Incoming market bid from alice for 0.6
+        let mut mkt_bid = test_order(7102, OrderType::Market, BidOrAsk::Bid, 0.6, None);
+        mkt_bid.owner_id = Some("alice".into());
+        let matched = book.match_market_order("BTC-USD", mkt_bid);
+
+        // Should skip 10000 (alice) and fill 0.5 at 10100 (bob)
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].matched_with_id, 7101);
+        assert_eq!(matched[0].price.integral(), 10100);
+        assert!((matched[0].amount - 0.5).abs() < 1e-9);
+
+        // Remaining: best ask 10000 by alice untouched, 10100 consumed
+        let asks = book.get_all_asks("BTC-USD");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].id, 7100);
+        assert!((asks[0].amount - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_market_ask_skips_stp_blocked_best_bid_and_fills_next() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<MatchedOrder>(64);
+        let mut book = OrderBook::new(tx);
+
+        // Best bid (9600) owned by alice -> STP should block incoming alice taker
+        let mut bid_best = test_order(7200, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9600.0));
+        bid_best.owner_id = Some("alice".into());
+        book.add_order("BTC-USD", bid_best, 0);
+
+        // Next bid (9400) owned by bob -> should be matched
+        let mut bid_next = test_order(7201, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9400.0));
+        bid_next.owner_id = Some("bob".into());
+        book.add_order("BTC-USD", bid_next, 0);
+
+        // Incoming market ask from alice for 0.6
+        let mut mkt_ask = test_order(7202, OrderType::Market, BidOrAsk::Ask, 0.6, None);
+        mkt_ask.owner_id = Some("alice".into());
+        let matched = book.match_market_order("BTC-USD", mkt_ask);
+
+        // Should skip 9600 (alice) and fill 0.6 at 9400 (bob)
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].matched_with_id, 7201);
+        assert_eq!(matched[0].price.integral(), 9400);
+        assert!((matched[0].amount - 0.6).abs() < 1e-9);
+
+        // Remaining bids: 9600 by alice untouched (1.0), 9400 reduced to 0.4
+        let bids = book.get_all_bids("BTC-USD");
+        // We expect 2 bids still present
+        assert_eq!(bids.len(), 2);
+        let b9400 = bids.iter().find(|o| o.id == 7201).unwrap();
+        let b9600 = bids.iter().find(|o| o.id == 7200).unwrap();
+        assert!((b9400.amount - 0.4).abs() < 1e-9);
+        assert!((b9600.amount - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_limit_gtc_skips_stp_blocked_best_and_rests_remainder() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<MatchedOrder>(64);
+        let mut book = OrderBook::new(tx);
+
+        // Best bid owned by alice -> STP blocks alice taker
+        let mut bid_best = test_order(7300, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9600.0));
+        bid_best.owner_id = Some("alice".into());
+        book.add_order("BTC-USD", bid_best, 0);
+
+        // Next bid owned by bob
+        let mut bid_next = test_order(7301, OrderType::Limit, BidOrAsk::Bid, 0.8, Some(9400.0));
+        bid_next.owner_id = Some("bob".into());
+        book.add_order("BTC-USD", bid_next, 0);
+
+        // Incoming limit ask (GTC) from alice sized 0.6 at price that will cross bids
+        let mut ask = test_order(7302, OrderType::Limit, BidOrAsk::Ask, 0.6, Some(9500.0));
+        ask.owner_id = Some("alice".into());
+        // Use add_order (will call match_limit_order)
+        book.add_order("BTC-USD", ask, 1);
+
+        // Should skip best (9600 by alice) and fill 0.6 at 9400 (bob) partially (0.6 of 0.8)
+        let bids = book.get_all_bids("BTC-USD");
+        // bob's bid should be reduced to 0.2, alice's best untouched
+        let b9400 = bids.iter().find(|o| o.id == 7301).unwrap();
+        let b9600 = bids.iter().find(|o| o.id == 7300).unwrap();
+        assert!((b9400.amount - 0.2).abs() < 1e-9);
+        assert!((b9600.amount - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_limit_ioc_skips_stp_blocked_best_and_cancels_remainder() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<MatchedOrder>(64);
+        let mut book = OrderBook::new(tx);
+
+        // Best bid owned by alice
+        let mut bid_best = test_order(7400, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9600.0));
+        bid_best.owner_id = Some("alice".into());
+        book.add_order("BTC-USD", bid_best, 0);
+
+        // Next bid owned by bob
+        let mut bid_next = test_order(7401, OrderType::Limit, BidOrAsk::Bid, 0.5, Some(9400.0));
+        bid_next.owner_id = Some("bob".into());
+        book.add_order("BTC-USD", bid_next, 0);
+
+        // Incoming IOC ask from alice for 0.6 at 9500
+        let mut ask = test_order(7402, OrderType::Limit, BidOrAsk::Ask, 0.6, Some(9500.0));
+        ask.owner_id = Some("alice".into());
+        ask.tif = Some(crate::models::Tif::Ioc);
+        book.add_order("BTC-USD", ask, 1);
+
+        // IOC should have filled 0.5 at 9400 (bob) and cancelled remaining 0.1 — no resting ask
+        let asks = book.get_all_asks("BTC-USD");
+        assert!(asks.is_empty());
+
+        // bids: 9600 alice untouched, 9400 fully consumed
+        let bids = book.get_all_bids("BTC-USD");
+        assert_eq!(bids.len(), 1);
+        let b9600 = bids.iter().find(|o| o.id == 7400).unwrap();
+        assert!((b9600.amount - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_limit_fok_fails_if_not_fully_fillable_across_eligible_levels() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<MatchedOrder>(64);
+        let mut book = OrderBook::new(tx);
+
+        // Only one eligible resting bid by bob for 0.4 at 9400
+        let mut bid_next = test_order(7501, OrderType::Limit, BidOrAsk::Bid, 0.4, Some(9400.0));
+        bid_next.owner_id = Some("bob".into());
+        book.add_order("BTC-USD", bid_next, 0);
+
+        // Incoming FOK ask from alice for 0.6 at 9500
+        let mut ask = test_order(7502, OrderType::Limit, BidOrAsk::Ask, 0.6, Some(9500.0));
+        ask.owner_id = Some("alice".into());
+        ask.tif = Some(crate::models::Tif::Fok);
+        book.add_order("BTC-USD", ask, 1);
+
+        // FOK cannot be fully filled -> cancelled
+        let asks = book.get_all_asks("BTC-USD");
+        assert!(asks.is_empty());
+        let bids = book.get_all_bids("BTC-USD");
+        assert_eq!(bids.len(), 1);
+        assert!((bids[0].amount - 0.4).abs() < 1e-9);
     }
 }

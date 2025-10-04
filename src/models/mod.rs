@@ -53,6 +53,10 @@ pub struct Order {
     pub price: Option<Price>,
     pub timestamp: u64,
     pub bid_or_ask: BidOrAsk,
+    pub owner_id: Option<String>,
+    pub tif: Option<Tif>,
+    pub post_only: bool,
+    pub max_slippage_bps: Option<f64>,
 }
 
 impl Order {
@@ -62,7 +66,7 @@ impl Order {
         trading_pair: String,
         amount: f64,
         price: Option<Price>,
-        timestamp: u64,
+        _timestamp: u64,
         bid_or_ask: BidOrAsk,
     ) -> Self {
         Self {
@@ -76,8 +80,19 @@ impl Order {
                 .unwrap()
                 .as_secs(),
             bid_or_ask,
+            owner_id: None,
+            tif: None,
+            post_only: false,
+            max_slippage_bps: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub enum Tif {
+    Gtc,
+    Ioc,
+    Fok,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
