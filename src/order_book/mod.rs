@@ -43,8 +43,6 @@ impl Default for OrderBook {
 }
 
 impl OrderBook {
-    // ...existing code...
-
     fn ensure_book(&mut self, trading_pair: &str) -> &mut SideBook {
         self.books
             .entry(trading_pair.to_string())
@@ -62,7 +60,7 @@ impl OrderBook {
         }
     }
 
-    pub fn add_order(&mut self, trading_pair: &str, mut order: Order, timestamp: u64) -> &Self {
+    pub fn add_order(&mut self, trading_pair: &str, mut order: Order, timestamp: u64) {
         order.timestamp = timestamp;
         order.trading_pair = trading_pair.to_string();
 
@@ -73,10 +71,10 @@ impl OrderBook {
         // Avoid creating an empty book just to run the check.
         if !is_market_order && order.tif == Some(Tif::Fok) {
             if self.get_book(trading_pair).is_none() {
-                return self;
+                return;
             }
             if !self.can_fully_fill_limit(trading_pair, &order) {
-                return self;
+                return;
             }
         }
 
@@ -104,8 +102,6 @@ impl OrderBook {
                 entry.push_back(order);
             }
         }
-
-        self
     }
 
     pub fn cancel_order(&mut self, trading_pair: &str, order_id: &str) -> Option<Order> {
