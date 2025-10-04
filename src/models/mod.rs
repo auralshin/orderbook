@@ -80,7 +80,7 @@ impl Order {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchedOrder {
     pub id: u64,
     pub matched_with_id: u64,
@@ -88,4 +88,5 @@ pub struct MatchedOrder {
     pub price: Price,
     pub amount: f64,
     pub bid_or_ask: BidOrAsk,
+    pub trading_pair: String,
 }

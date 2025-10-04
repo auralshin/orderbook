@@ -2,13 +2,18 @@ use crate::models::{BidOrAsk, MatchedOrder, Order, OrderType, Price};
 use serde::Deserialize;
 use serde::Serialize;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::mpsc::Sender;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SideBook {
+    pub bids: BTreeMap<Price, VecDeque<Order>>,
+    pub asks: BTreeMap<Price, VecDeque<Order>>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OrderBook {
-    pub bids: BTreeMap<Price, VecDeque<Order>>,
-    pub asks: BTreeMap<Price, VecDeque<Order>>,
+    pub books: HashMap<String, SideBook>,
     #[serde(skip_serializing, skip_deserializing)]
     notifier: Option<Sender<MatchedOrder>>,
 }
@@ -16,34 +21,42 @@ pub struct OrderBook {
 impl Default for OrderBook {
     fn default() -> Self {
         Self {
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            books: HashMap::new(),
             notifier: None,
         }
     }
 }
 
 impl OrderBook {
+    fn ensure_book(&mut self, trading_pair: &str) -> &mut SideBook {
+        self.books
+            .entry(trading_pair.to_string())
+            .or_insert_with(SideBook::default)
+    }
+
+    fn get_book(&self, trading_pair: &str) -> Option<&SideBook> {
+        self.books.get(trading_pair)
+    }
+
     pub fn new(notifier: Sender<MatchedOrder>) -> Self {
         Self {
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            books: HashMap::new(),
             notifier: Some(notifier),
         }
     }
-
-    pub fn add_order(&mut self, mut order: Order, timestamp: u64) -> &Self {
+    pub fn add_order(&mut self, trading_pair: &str, mut order: Order, timestamp: u64) -> &Self {
         order.timestamp = timestamp;
+        order.trading_pair = trading_pair.to_string();
 
         let is_market_order = order.order_type == OrderType::Market;
         let bid_or_ask = order.bid_or_ask.clone();
 
-        let price = order.price.clone().unwrap();
+        self.ensure_book(trading_pair);
 
         let matched_orders = if is_market_order {
-            self.match_market_order(order.clone())
+            self.match_market_order(trading_pair, order.clone())
         } else {
-            self.match_limit_order(order.clone())
+            self.match_limit_order(trading_pair, order.clone())
         };
 
         if !matched_orders.is_empty() {
@@ -52,178 +65,199 @@ impl OrderBook {
         }
 
         if order.amount > 0.0 {
-            let book = match bid_or_ask {
-                BidOrAsk::Bid => &mut self.bids,
-                BidOrAsk::Ask => &mut self.asks,
-            };
-            let entry = book.entry(price).or_insert_with(VecDeque::new);
-            entry.push_back(order);
+            if let Some(price) = order.price.clone() {
+                let side_book = self.ensure_book(trading_pair);
+                let book = match bid_or_ask {
+                    BidOrAsk::Bid => &mut side_book.bids,
+                    BidOrAsk::Ask => &mut side_book.asks,
+                };
+                let entry = book.entry(price).or_insert_with(VecDeque::new);
+                entry.push_back(order);
+            }
         }
 
         self
     }
 
-    pub fn cancel_order(&mut self, order_id: &str) -> Option<Order> {
+    pub fn cancel_order(&mut self, trading_pair: &str, order_id: &str) -> Option<Order> {
         let mut removed_price = None;
         let mut removed_order = None;
-
-        for (price, orders) in self.bids.iter_mut() {
-            if let Some(pos) = orders.iter().position(|o| o.id.to_string() == order_id) {
-                removed_order = orders.remove(pos);
-                if orders.is_empty() {
-                    removed_price = Some(*price);
+        if let Some(side_book) = self.books.get_mut(trading_pair) {
+            for (price, orders) in side_book.bids.iter_mut() {
+                if let Some(pos) = orders.iter().position(|o| o.id.to_string() == order_id) {
+                    removed_order = orders.remove(pos);
+                    if orders.is_empty() {
+                        removed_price = Some(*price);
+                    }
+                    break;
                 }
-                break;
+            }
+            if let Some(price) = removed_price {
+                side_book.bids.remove(&price);
+                removed_price = None;
+            }
+            if removed_order.is_none() {
+                for (price, orders) in side_book.asks.iter_mut() {
+                    if let Some(pos) = orders.iter().position(|o| o.id.to_string() == order_id) {
+                        removed_order = orders.remove(pos);
+                        if orders.is_empty() {
+                            removed_price = Some(*price);
+                        }
+                        break;
+                    }
+                }
+                if let Some(price) = removed_price {
+                    side_book.asks.remove(&price);
+                }
             }
         }
-        if let Some(price) = removed_price {
-            self.bids.remove(&price);
-            return removed_order;
-        }
-        if removed_order.is_some() {
-            return removed_order;
+
+        if self
+            .books
+            .get(trading_pair)
+            .map(|book| book.bids.is_empty() && book.asks.is_empty())
+            .unwrap_or(false)
+        {
+            self.books.remove(trading_pair);
         }
 
-        removed_price = None;
-
-        for (price, orders) in self.asks.iter_mut() {
-            if let Some(pos) = orders.iter().position(|o| o.id.to_string() == order_id) {
-                removed_order = orders.remove(pos);
-                if orders.is_empty() {
-                    removed_price = Some(*price);
-                }
-                break;
-            }
-        }
-        if let Some(price) = removed_price {
-            self.asks.remove(&price);
-        }
         removed_order
     }
 
-    pub fn get_all_bids(&self) -> Vec<Order> {
+    pub fn get_all_bids(&self, trading_pair: &str) -> Vec<Order> {
         let mut orders = Vec::new();
-        for (_, order) in self.bids.iter() {
-            for o in order.iter() {
-                orders.push(o.clone());
-            }
-        }
-        orders
-    }
-
-    pub fn get_all_asks(&self) -> Vec<Order> {
-        let mut orders = Vec::new();
-        for (_, order) in self.asks.iter() {
-            for o in order.iter() {
-                orders.push(o.clone());
-            }
-        }
-        orders
-    }
-
-    pub fn get_orders(&self) -> Vec<Order> {
-        let mut orders = Vec::new();
-        for (_, order) in self.bids.iter() {
-            for o in order.iter() {
-                orders.push(o.clone());
-            }
-        }
-        for (_, order) in self.asks.iter() {
-            for o in order.iter() {
-                orders.push(o.clone());
-            }
-        }
-        orders
-    }
-
-    pub fn get_order_by_id(&self, id: u64) -> Option<&Order> {
-        for (_, orders) in self.bids.iter() {
-            for order in orders.iter() {
-                if order.id == id {
-                    return Some(order);
+        if let Some(side_book) = self.get_book(trading_pair) {
+            for (_, order) in side_book.bids.iter() {
+                for o in order.iter() {
+                    orders.push(o.clone());
                 }
             }
         }
-        for (_, orders) in self.asks.iter() {
-            for order in orders.iter() {
-                if order.id == id {
-                    return Some(order);
+        orders
+    }
+
+    pub fn get_all_asks(&self, trading_pair: &str) -> Vec<Order> {
+        let mut orders = Vec::new();
+        if let Some(side_book) = self.get_book(trading_pair) {
+            for (_, order) in side_book.asks.iter() {
+                for o in order.iter() {
+                    orders.push(o.clone());
+                }
+            }
+        }
+        orders
+    }
+
+    pub fn get_orders(&self, trading_pair: &str) -> Vec<Order> {
+        let mut orders = Vec::new();
+        if let Some(side_book) = self.get_book(trading_pair) {
+            for (_, order) in side_book.bids.iter() {
+                for o in order.iter() {
+                    orders.push(o.clone());
+                }
+            }
+            for (_, order) in side_book.asks.iter() {
+                for o in order.iter() {
+                    orders.push(o.clone());
+                }
+            }
+        }
+        orders
+    }
+
+    pub fn get_order_by_id(&self, trading_pair: &str, id: u64) -> Option<&Order> {
+        if let Some(side_book) = self.get_book(trading_pair) {
+            for (_, orders) in side_book.bids.iter() {
+                for order in orders.iter() {
+                    if order.id == id {
+                        return Some(order);
+                    }
+                }
+            }
+            for (_, orders) in side_book.asks.iter() {
+                for order in orders.iter() {
+                    if order.id == id {
+                        return Some(order);
+                    }
                 }
             }
         }
         None
     }
 
-    pub fn get_market_orders_to_match(&self) -> Vec<Order> {
+    pub fn get_market_orders_to_match(&self, trading_pair: &str) -> Vec<Order> {
         let mut orders = Vec::new();
-        for (_, order) in self.bids.iter() {
-            for o in order.iter() {
-                if o.order_type == OrderType::Market {
-                    orders.push(o.clone());
+        if let Some(side_book) = self.get_book(trading_pair) {
+            for (_, order) in side_book.bids.iter() {
+                for o in order.iter() {
+                    if o.order_type == OrderType::Market {
+                        orders.push(o.clone());
+                    }
                 }
             }
-        }
-        for (_, order) in self.asks.iter() {
-            for o in order.iter() {
-                if o.order_type == OrderType::Market {
-                    orders.push(o.clone());
+            for (_, order) in side_book.asks.iter() {
+                for o in order.iter() {
+                    if o.order_type == OrderType::Market {
+                        orders.push(o.clone());
+                    }
                 }
             }
         }
         orders
     }
 
-    pub fn get_limit_orders_to_match(&self) -> Vec<Order> {
+    pub fn get_limit_orders_to_match(&self, trading_pair: &str) -> Vec<Order> {
         let mut orders = Vec::new();
-        for (_, order) in self.bids.iter() {
-            for o in order.iter() {
-                if o.order_type == OrderType::Limit {
-                    orders.push(o.clone());
+        if let Some(side_book) = self.get_book(trading_pair) {
+            for (_, order) in side_book.bids.iter() {
+                for o in order.iter() {
+                    if o.order_type == OrderType::Limit {
+                        orders.push(o.clone());
+                    }
                 }
             }
-        }
-        for (_, order) in self.asks.iter() {
-            for o in order.iter() {
-                if o.order_type == OrderType::Limit {
-                    orders.push(o.clone());
+            for (_, order) in side_book.asks.iter() {
+                for o in order.iter() {
+                    if o.order_type == OrderType::Limit {
+                        orders.push(o.clone());
+                    }
                 }
             }
         }
         orders
     }
 
-    pub fn get_best_bid(&self) -> Option<&Price> {
-        self.bids.keys().next_back()
+    pub fn get_best_bid(&self, trading_pair: &str) -> Option<&Price> {
+        self.get_book(trading_pair)
+            .and_then(|book| book.bids.keys().next_back())
     }
 
-    pub fn get_best_ask(&self) -> Option<&Price> {
-        self.asks.keys().next()
+    pub fn get_best_ask(&self, trading_pair: &str) -> Option<&Price> {
+        self.get_book(trading_pair)
+            .and_then(|book| book.asks.keys().next())
     }
 
-    pub fn match_market_order(&mut self, market_order: Order) -> Vec<MatchedOrder> {
+    pub fn match_market_order(
+        &mut self,
+        trading_pair: &str,
+        market_order: Order,
+    ) -> Vec<MatchedOrder> {
         let mut matched_orders = Vec::new();
         let mut removal_candidates = Vec::new();
         let mut remaining_amount = market_order.amount;
-        let _order_id = market_order.id;
 
-        let book = match market_order.bid_or_ask {
-            BidOrAsk::Bid => &mut self.asks,
-            BidOrAsk::Ask => &mut self.bids,
+        let maybe_book = self.books.get_mut(trading_pair);
+        if maybe_book.is_none() {
+            return matched_orders;
+        }
+        let book = maybe_book.unwrap();
+
+        let book_side = match market_order.bid_or_ask {
+            BidOrAsk::Bid => &mut book.asks,
+            BidOrAsk::Ask => &mut book.bids,
         };
 
-        if let Some((first_price, _)) = book.iter().next() {
-            if market_order.bid_or_ask == BidOrAsk::Bid
-                && *first_price >= market_order.price.unwrap_or(Price::new(f64::MAX))
-            {
-                return matched_orders;
-            }
-            if market_order.bid_or_ask == BidOrAsk::Ask
-                && *first_price < market_order.price.unwrap_or(Price::new(f64::MIN))
-            {
-                return matched_orders;
-            }
-        }
-        let mut book_iter = book.iter_mut();
+        let mut book_iter = book_side.iter_mut();
 
         while remaining_amount > 0.0 {
             if let Some((price, orders)) = book_iter.next() {
@@ -247,6 +281,7 @@ impl OrderBook {
                         price: price.clone(),
                         amount: filled_amount,
                         bid_or_ask: market_order.bid_or_ask.clone(),
+                        trading_pair: trading_pair.to_string(),
                     });
 
                     if remaining_amount <= 0.0 {
@@ -263,7 +298,7 @@ impl OrderBook {
         }
 
         for price in removal_candidates {
-            book.remove(&price);
+            book_side.remove(&price);
         }
         for matched_order in &matched_orders {
             if let Some(sender) = self.notifier.as_ref() {
@@ -274,16 +309,27 @@ impl OrderBook {
         matched_orders
     }
 
-    pub fn match_limit_order(&mut self, limit_order: Order) -> Vec<MatchedOrder> {
+    pub fn match_limit_order(
+        &mut self,
+        trading_pair: &str,
+        limit_order: Order,
+    ) -> Vec<MatchedOrder> {
         let mut matched_orders = Vec::new();
-        let order_type = limit_order.order_type;
         let bid_or_ask = limit_order.bid_or_ask;
-        let order_price = limit_order.price; // Clone the price if necessary
-        let order_id = limit_order.id;
 
-        let book = match bid_or_ask {
-            BidOrAsk::Bid => &mut self.asks,
-            BidOrAsk::Ask => &mut self.bids,
+        let order_price = limit_order
+            .price
+            .expect("Limit orders must specify a price");
+
+        let maybe_book = self.books.get_mut(trading_pair);
+        if maybe_book.is_none() {
+            return matched_orders;
+        }
+        let book = maybe_book.unwrap();
+
+        let book_side = match bid_or_ask {
+            BidOrAsk::Bid => &mut book.asks,
+            BidOrAsk::Ask => &mut book.bids,
         };
 
         let mut remaining_amount = limit_order.amount;
@@ -292,10 +338,9 @@ impl OrderBook {
             let mut to_remove = Vec::new();
             let mut matched = false;
 
-            for (price, orders) in book.iter_mut() {
-                if (limit_order.bid_or_ask == BidOrAsk::Bid && *price > limit_order.price.unwrap())
-                    || (limit_order.bid_or_ask == BidOrAsk::Ask
-                        && *price < limit_order.price.unwrap())
+            for (price, orders) in book_side.iter_mut() {
+                if (limit_order.bid_or_ask == BidOrAsk::Bid && *price > order_price)
+                    || (limit_order.bid_or_ask == BidOrAsk::Ask && *price < order_price)
                 {
                     break;
                 }
@@ -321,6 +366,7 @@ impl OrderBook {
                         amount: filled_amount,
 
                         bid_or_ask: limit_order.bid_or_ask.clone(),
+                        trading_pair: trading_pair.to_string(),
                     });
 
                     matched = true;
@@ -340,7 +386,7 @@ impl OrderBook {
             }
 
             for price in to_remove {
-                book.remove(&price);
+                book_side.remove(&price);
             }
 
             if !matched {
@@ -393,14 +439,14 @@ mod tests {
         order_type: OrderType,
         bid_or_ask: BidOrAsk,
         amount: f64,
-        price: f64,
+        price: Option<f64>,
     ) -> Order {
         Order {
             id,
             order_type,
             trading_pair: "BTC-USD".to_string(),
             amount,
-            price: Some(Price::new(price)),
+            price: price.map(Price::new),
             timestamp: 0,
             bid_or_ask,
         }
@@ -411,10 +457,10 @@ mod tests {
         let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
         let mut book = OrderBook::new(dummy_tx);
 
-        let order = test_order(1, OrderType::Limit, BidOrAsk::Bid, 1.0, 10000.0);
-        book.add_order(order, 0);
+        let order = test_order(1, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(10000.0));
+        book.add_order("BTC-USD", order, 0);
 
-        let bids = book.get_all_bids();
+        let bids = book.get_all_bids("BTC-USD");
         assert_eq!(bids.len(), 1);
         assert_eq!(bids[0].amount, 1.0);
     }
@@ -424,10 +470,10 @@ mod tests {
         let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
         let mut book = OrderBook::new(dummy_tx);
 
-        let order = test_order(2, OrderType::Limit, BidOrAsk::Ask, 2.0, 10500.0);
-        book.add_order(order, 0);
+        let order = test_order(2, OrderType::Limit, BidOrAsk::Ask, 2.0, Some(10500.0));
+        book.add_order("BTC-USD", order, 0);
 
-        let asks = book.get_all_asks();
+        let asks = book.get_all_asks("BTC-USD");
         assert_eq!(asks.len(), 1);
         assert_eq!(asks[0].amount, 2.0);
     }
@@ -437,11 +483,11 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<MatchedOrder>();
         let mut book = OrderBook::new(tx);
 
-        let ask = test_order(10, OrderType::Limit, BidOrAsk::Ask, 1.0, 9500.0);
-        book.add_order(ask, 0);
+        let ask = test_order(10, OrderType::Limit, BidOrAsk::Ask, 1.0, Some(9500.0));
+        book.add_order("BTC-USD", ask, 0);
 
-        let bid = test_order(11, OrderType::Limit, BidOrAsk::Bid, 1.0, 9600.0);
-        let matches = book.match_limit_order(bid);
+        let bid = test_order(11, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9600.0));
+        let matches = book.match_limit_order("BTC-USD", bid);
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].matched_with_id, 10);
@@ -452,17 +498,17 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel::<MatchedOrder>();
         let mut book = OrderBook::new(tx);
 
-        let ask = test_order(1, OrderType::Limit, BidOrAsk::Ask, 2.0, 9500.0);
-        book.add_order(ask, 0);
+        let ask = test_order(1, OrderType::Limit, BidOrAsk::Ask, 2.0, Some(9500.0));
+        book.add_order("BTC-USD", ask, 0);
 
-        let bid = test_order(2, OrderType::Limit, BidOrAsk::Bid, 1.0, 9600.0);
-        let matched = book.match_limit_order(bid);
+        let bid = test_order(2, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9600.0));
+        let matched = book.match_limit_order("BTC-USD", bid);
 
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].amount, 1.0);
 
         // Check remaining ask
-        let remaining = book.get_all_asks();
+        let remaining = book.get_all_asks("BTC-USD");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].amount, 1.0);
     }
@@ -472,18 +518,18 @@ mod tests {
         let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
         let mut book = OrderBook::new(dummy_tx);
 
-        let ask1 = test_order(1, OrderType::Limit, BidOrAsk::Ask, 1.0, 9800.0);
-        let ask2 = test_order(2, OrderType::Limit, BidOrAsk::Ask, 1.0, 9700.0);
-        book.add_order(ask1, 0);
-        book.add_order(ask2, 0);
+        let ask1 = test_order(1, OrderType::Limit, BidOrAsk::Ask, 1.0, Some(9800.0));
+        let ask2 = test_order(2, OrderType::Limit, BidOrAsk::Ask, 1.0, Some(9700.0));
+        book.add_order("BTC-USD", ask1, 0);
+        book.add_order("BTC-USD", ask2, 0);
 
-        let bid1 = test_order(3, OrderType::Limit, BidOrAsk::Bid, 1.0, 9400.0);
-        let bid2 = test_order(4, OrderType::Limit, BidOrAsk::Bid, 1.0, 9600.0);
-        book.add_order(bid1, 0);
-        book.add_order(bid2, 0);
+        let bid1 = test_order(3, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9400.0));
+        let bid2 = test_order(4, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(9600.0));
+        book.add_order("BTC-USD", bid1, 0);
+        book.add_order("BTC-USD", bid2, 0);
 
-        let best_ask = book.get_best_ask().unwrap();
-        let best_bid = book.get_best_bid().unwrap();
+        let best_ask = book.get_best_ask("BTC-USD").unwrap();
+        let best_bid = book.get_best_bid("BTC-USD").unwrap();
 
         assert_eq!(best_ask.integral(), 9700);
         assert_eq!(best_bid.integral(), 9600);
@@ -494,12 +540,12 @@ mod tests {
         let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
         let mut book = OrderBook::new(dummy_tx);
 
-        let ask1 = test_order(1, OrderType::Limit, BidOrAsk::Ask, 1.0, 9800.0);
-        book.add_order(ask1, 0);
+        let ask1 = test_order(1, OrderType::Limit, BidOrAsk::Ask, 1.0, Some(9800.0));
+        book.add_order("BTC-USD", ask1, 0);
 
-        let canceled_order = book.cancel_order("1");
+        let canceled_order = book.cancel_order("BTC-USD", "1");
         assert!(canceled_order.is_some());
-        assert!(book.get_all_bids().is_empty());
+        assert!(book.get_all_bids("BTC-USD").is_empty());
     }
 
     #[test]
@@ -507,10 +553,42 @@ mod tests {
         let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
         let mut book = OrderBook::new(dummy_tx);
 
-        let order = test_order(1, OrderType::Limit, BidOrAsk::Bid, 1.0, 10000.0);
-        book.add_order(order, 0);
+        let order = test_order(1, OrderType::Limit, BidOrAsk::Bid, 1.0, Some(10000.0));
+        book.add_order("BTC-USD", order, 0);
 
-        let removed = book.cancel_order("999");
+        let removed = book.cancel_order("BTC-USD", "999");
         assert!(removed.is_none());
+    }
+
+    #[test]
+    fn test_match_market_order_without_price_uses_book_price() {
+        let (tx, _rx) = std::sync::mpsc::channel::<MatchedOrder>();
+        let mut book = OrderBook::new(tx);
+
+        let ask = test_order(1, OrderType::Limit, BidOrAsk::Ask, 1.5, Some(9500.0));
+        book.add_order("BTC-USD", ask, 0);
+
+        let market_bid = test_order(2, OrderType::Market, BidOrAsk::Bid, 1.0, None);
+        let matches = book.match_market_order("BTC-USD", market_bid);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].price.integral(), 9500);
+        assert_eq!(matches[0].amount, 1.0);
+
+        let remaining_asks = book.get_all_asks("BTC-USD");
+        assert_eq!(remaining_asks.len(), 1);
+        assert_eq!(remaining_asks[0].amount, 0.5);
+    }
+
+    #[test]
+    fn test_unmatched_market_order_not_added_to_book() {
+        let dummy_tx = std::sync::mpsc::channel::<MatchedOrder>().0;
+        let mut book = OrderBook::new(dummy_tx);
+
+        let market_bid = test_order(1, OrderType::Market, BidOrAsk::Bid, 2.0, None);
+        book.add_order("BTC-USD", market_bid, 0);
+
+        assert!(book.get_all_bids("BTC-USD").is_empty());
+        assert!(book.get_all_asks("BTC-USD").is_empty());
     }
 }
