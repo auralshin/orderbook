@@ -3,17 +3,16 @@ use actix_web::{http, web, App, HttpServer};
 use models::MatchedOrder;
 use order_book::OrderBook;
 use orderbook::{api, models, order_book};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let (tx, rx) = mpsc::channel::<MatchedOrder>();
-    let order_book = Arc::new(Mutex::new(OrderBook::new(tx)));
-    let rx = Arc::new(Mutex::new(rx));
+    let (tx, _rx) = broadcast::channel::<MatchedOrder>(64);
+    let order_book = Arc::new(Mutex::new(OrderBook::new(tx.clone())));
     HttpServer::new(move || {
         let order_book = Arc::clone(&order_book);
-        let rx_clone = Arc::clone(&rx);
+        let tx_clone = tx.clone();
         let cors = Cors::default()
             .allowed_origin("http://localhost:3000") // Add your frontend url here
             .allowed_methods(vec!["GET", "POST", "OPTIONS"])
@@ -24,7 +23,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(cors)
             .app_data(web::Data::new(order_book)) // Share the OrderBook state with the app
-            .configure(|cfg| api::config(cfg, rx_clone)) // Configure your API routes
+            .configure(|cfg| api::config(cfg, tx_clone.clone())) // Configure your API routes
     })
     .bind("127.0.0.1:8080")?
     .run()

@@ -1,14 +1,12 @@
 use actix_web::{test, App};
 use orderbook::api;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 #[actix_web::test]
 async fn test_health_check() {
-    let (_tx, rx) = mpsc::channel();
-    let rx = Arc::new(Mutex::new(rx));
+    let (tx, _rx) = broadcast::channel::<orderbook::models::MatchedOrder>(64);
 
-    let app = test::init_service(App::new().configure(|cfg| api::config(cfg, rx.clone()))).await;
+    let app = test::init_service(App::new().configure(|cfg| api::config(cfg, tx.clone()))).await;
 
     let req = test::TestRequest::get().uri("/healthcheck").to_request();
     let resp = test::call_service(&app, req).await;

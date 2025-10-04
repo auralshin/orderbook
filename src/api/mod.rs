@@ -3,39 +3,46 @@ use crate::order_book::OrderBook;
 use crate::websocket::MyWebSocket;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_web_actors::ws;
-use serde::Deserialize;
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use tokio::sync::broadcast;
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct TradingPairPath {
     trading_pair: String,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct TradingPairOrderPath {
     trading_pair: String,
     order_id: String,
 }
 
-pub fn config(cfg: &mut web::ServiceConfig, rx: Arc<Mutex<Receiver<MatchedOrder>>>) {
-    cfg.app_data(web::Data::new(rx.clone()));
+pub fn config(cfg: &mut web::ServiceConfig, tx: broadcast::Sender<MatchedOrder>) {
+    let sender_data = web::Data::new(tx);
+    cfg.app_data(sender_data.clone());
     cfg.service(web::resource("/ws/{trading_pair}").route(web::get().to(websocket_handler)));
     cfg.service(web::resource("/healthcheck").route(web::get().to(health_check)));
     cfg.service(
-        web::scope("/{trading_pair}")
-            .service(
-                web::resource("/orders")
-                    .route(web::post().to(create_order))
-                    .route(web::get().to(get_orders)),
-            )
-            .service(web::resource("/orders/{order_id}").route(web::delete().to(cancel_order)))
-            .service(web::resource("/asks").route(web::get().to(get_all_asks)))
-            .service(web::resource("/bids").route(web::get().to(get_all_bids)))
-            .service(web::resource("/best_bid").route(web::get().to(best_bid)))
-            .service(web::resource("/best_ask").route(web::get().to(best_ask))),
+        web::resource("/orders")
+            .route(web::post().to(create_order))
+            .route(web::get().to(get_orders)),
     );
+    cfg.service(web::resource("/orders/{order_id}").route(web::delete().to(cancel_order)));
+    cfg.service(web::resource("/asks").route(web::get().to(get_all_asks)));
+    cfg.service(web::resource("/bids").route(web::get().to(get_all_bids)));
+    cfg.service(web::resource("/best_bid").route(web::get().to(best_bid)));
+    cfg.service(web::resource("/best_ask").route(web::get().to(best_ask)));
+}
+
+async fn websocket_handler(
+    path: web::Path<TradingPairPath>,
+    req: HttpRequest,
+    stream: web::Payload,
+    tx: web::Data<broadcast::Sender<MatchedOrder>>,
+) -> Result<HttpResponse, actix_web::Error> {
+    println!("Websocket connection requested for {}", path.trading_pair);
+    ws::start(MyWebSocket::new(tx.subscribe()), &req, stream)
 }
 
 async fn health_check() -> HttpResponse {
@@ -124,18 +131,4 @@ async fn best_ask(
     let order_book = order_book.lock().unwrap();
     let best_ask = order_book.get_best_ask(trading_pair.as_str()).copied();
     HttpResponse::Ok().json(best_ask)
-}
-
-async fn websocket_handler(
-    path: web::Path<TradingPairPath>,
-    req: HttpRequest,
-    stream: web::Payload,
-    rx: web::Data<Arc<Mutex<Receiver<MatchedOrder>>>>,
-) -> Result<HttpResponse, actix_web::Error> {
-    let trading_pair = path.into_inner();
-    println!(
-        "Websocket connection requested for {}",
-        trading_pair.trading_pair
-    );
-    ws::start(MyWebSocket::new(rx.get_ref().clone()), &req, stream)
 }
