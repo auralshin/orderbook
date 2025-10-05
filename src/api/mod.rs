@@ -57,7 +57,7 @@ async fn create_order(
     let order = order.into_inner();
     let trading_pair = path.into_inner().trading_pair;
     let mut order_book = order_book.lock().unwrap(); // Lock the shared OrderBook
-    let order_book = order_book.add_order(
+    order_book.add_order(
         trading_pair.as_str(),
         order,
         SystemTime::now()
@@ -65,8 +65,8 @@ async fn create_order(
             .unwrap()
             .as_secs(),
     );
-    println!("{:?}", order_book);
-    HttpResponse::Ok().body(format!("{:?}", order_book))
+    println!("{:?}", *order_book);
+    HttpResponse::Ok().body(format!("{:?}", *order_book))
 }
 
 async fn get_all_asks(
